@@ -1,0 +1,38 @@
+[workspace]
+channels = ["conda-forge"]
+name = "gnn_recsys"
+platforms = [{platform = "linux-64", cuda = "13.0"}]
+version = "0.1.0"
+description = ""
+authors = ["Milnner Kauan Torres Andrade <milnnernj@gmail.com>"]
+
+[dependencies]
+python = "3.11.*"
+ipykernel = "*"
+pandas = "*"
+wandb = "*"
+hydra-core = ">=1.3.2"
+
+
+[pypi-dependencies]
+
+# ---------------------------------------------------------
+# SETUP DO PYTORCH & PYG (100% via PIP - O Padrão Atual)
+# ---------------------------------------------------------
+torch = "==2.12.0"
+torchmetrics = "*"
+torchvision = "*"
+pyg_lib = "*"
+torch_sparse = "*"
+torch_scatter = "*"
+torch-geometric = ">=2.7.0, <3"
+pytest = ">=9.2.0, <10"
+ipywidgets = ">=8.1.9, <9"
+numpy = "*"
+polars = ">=2.1.0, <3"
+
+
+[pypi-options]
+index-url = "https://pypi.org/simple"
+extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.12.0+cu130.html" }]
