@@ -1,0 +1,55 @@
+[project]
+name = "recsys"
+version = "0.1.0"
+description = ""
+authors = [{ name = "Milnner Kauan Torres Andrade", email = "milnnernj@gmail.com" }]
+requires-python = ">=3.11,<3.12"
+
+# Deps PyPI — instaladas com os index/find-links de [tool.pixi.pypi-options]
+dependencies = [
+    "torch==2.12.0",
+    "torchmetrics>=1.7.4",
+    "torchvision",
+    "pyg-lib",
+    "torch-sparse",
+    "torch-scatter",
+    "torch-geometric>=2.7.0,<3",
+    "numpy",
+    "polars>=2.1.0,<3",
+    "scikit-learn>=1.9.1,<2",
+    "wandb>=0.31.0,<0.32",
+    "ipywidgets>=8.1.9,<9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.2.0,<10"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["code"]
+
+# ============================================================
+# Equivalente ao pixi.toml antigo -- pixi lê daqui nativamente
+# ============================================================
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+ipykernel = "*"
+pandas = "*"
+hydra-core = ">=1.3.2"
+
+[tool.pixi.pypi-options]
+index-url = "https://pypi.org/simple"
+extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
+find-links = [{ url = "https://data.pyg.org/whl/torch-2.12.0+cu130.html" }]
+index-strategy = "unsafe-best-match"
+
+[tool.pixi.pypi-dependencies]
+recsys = { path = ".", editable = true }

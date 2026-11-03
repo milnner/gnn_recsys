@@ -1,0 +1,11 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+pixi.lock
+.vscode/
+
+wandb/
+
+code/**/*.pyc
+code/recsys.egg-info
+data/*
