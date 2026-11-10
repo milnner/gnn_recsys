@@ -144,6 +144,10 @@ class ML32MGraph:
       data["movie"].x = self.movie_features
     data["user", "rates", "movie"].edge_index = self.edge_index
     data["movie", "rated_by", "user"].edge_index = self.edge_index.flip(0)
+    
+    data["user", "rates", "movie"].edge_label = self.edge_ratings
+    data["movie", "rated_by", "user"].edge_label = self.edge_ratings
+
     return data
     
 

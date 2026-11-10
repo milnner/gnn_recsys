@@ -1,10 +1,11 @@
 [workspace]
 channels = ["conda-forge"]
 name = "gnn_recsys"
-platforms = [{platform = "linux-64", cuda = "13.0"}]
+platforms = ["linux-64"]
 version = "0.1.0"
 description = ""
 authors = ["Milnner Kauan Torres Andrade <milnnernj@gmail.com>"]
+
 
 [dependencies]
 python = "3.11.*"

@@ -131,7 +131,7 @@ def per_src_k_fold(
                          counts.cumsum(0)])
     order_src = src[order]
     rank      = torch.arange(E, device=dev) - offsets[order_src]
-    
+
     # 4. Round-robin: fold = rank % n_folds
     fold_local = (rank % n_folds).to(torch.long)
 
