@@ -1,22 +1,60 @@
 from pathlib import Path
+from typing import List, Optional, Union
 import torch
 from torch import Tensor
 from torch_geometric.data import Data, HeteroData
 
 
-class ML32MGraph:
-    """Grafo bipartido heterogêno do ML-32M, com adaptadores PyG."""
+class MovielensGraphs:
+    """Grafo bipartido heterogêno para os datasets ML-32M, ML-25M, ML-20M, ML-10M e ML-1M."""
+
+    DATASETS_ALIASES = {
+        "ml-32m": "ml-32m",
+        "ml32m": "ml-32m",
+        "ml-25m": "ml-25m",
+        "ml25m": "ml-25m",
+        "ml-20m": "ml-20m",
+        "ml20m": "ml-20m",
+        "ml-10m": "ml-10m",
+        "ml10m": "ml-10m",
+        "ml-1m": "ml-1m",
+        "ml1m": "ml-1m",
+    }
+
+    @classmethod
+    def get_valid_datasets(cls) -> list[str]:
+        """Retorna os identificadores válidos dos datasets MovieLens."""
+        return list((cls.DATASETS_ALIASES.keys()))
+
+    @classmethod
+    def get_dataset_normalized(cls, dataset: str) -> str:
+        if not isinstance(dataset, str):
+            raise TypeError(f"dataset deve ser str, recebido: {type(dataset).__name__}")
+        normalized = dataset.strip().lower()
+        if normalized not in cls.DATASETS_ALIASES:
+            valids = ", ".join(cls.get_valid_datasets())
+            raise ValueError(
+                f"dataset={dataset!r} é inválido, opções aceitas: {valids}"
+            )
+        return cls.DATASETS_ALIASES[normalized]
 
     def __init__(
         self,
-        root,
-        device="cpu",
+        root: Union[str, Path],
+        dataset: Optional[str],
+        device: Union[str, torch.device] = "cpu",
         edge_dtype=torch.int64,
         feature_dtype=torch.float32,
         load_edge_ts=False,
         normalize_ratings=True,
     ):
-        self.root = Path(root)
+        dataset = MovielensGraphs.get_dataset_normalized(dataset)
+
+        if isinstance(root, Path):
+            self.root = root / dataset
+        elif isinstance(root, str):
+            self.root = Path(root) / dataset
+
         self.device = torch.device(device)
         self._edge_dtype = edge_dtype
         self._feature_dtype = feature_dtype
@@ -107,7 +145,7 @@ class ML32MGraph:
         g["movie_ids"] = g["movie_ids"].to(self.device)
         g["edge_ratings"] = g["edge_ratings"].to(self.device)
         if self.normalize_ratings:
-            g["edge_ratings"] = g["edge_ratings"] / g["edge_ratings"]
+            g["edge_ratings"] = g["edge_ratings"] / 0.5
         if self.load_edge_ts:
             g["edge_ts"] = g["edge_ts"].to(self.device)
         else:
@@ -172,8 +210,9 @@ class ML32MGraph:
 
 
 if __name__ == "__main__":
-    g = ML32MGraph(
-        root="/home/milnner00/projects/recsys_experiment/data/ml-32m",
+    g = MovielensGraphs(
+        root="/home/milnner00/projects/gnn_recsys/data",
+        dataset="ml-1m",
         device="cpu",
         load_edge_ts=True,
     )

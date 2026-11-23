@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 from torch_geometric.data import HeteroData
 
-from recsys.datasets import ML32MGraph
+from recsys.datasets import MovielensGraphs
 from recsys.splits import per_src_leave_k_edges
 
 EdgeType = Tuple[str, str, str]
@@ -34,15 +34,13 @@ class PrepDataset:
         return self.hetero_data[self.edge].edge_index[:, self.test_idx]
 
 
-def _load_ml32m(
-    root: Union[str, Path],
+def _load_movielens(
+    g: Union[MovielensGraphs],
     leave_k: int,
     device: torch.device,
     data_device: torch.device,
     rgn: Optional[torch.Generator] = None,
-    load_edge_ts: bool = True,
 ) -> PrepDataset:
-    g = ML32MGraph(root=str(root), device=str(data_device), load_edge_ts=load_edge_ts)
 
     train_idx, test_idx = per_src_leave_k_edges(
         g.edge_index.to(device),
@@ -96,14 +94,21 @@ def get_dataset(
 ) -> PrepDataset:
     name = dataset.lower().strip()
 
-    if name in {"ml-32m", "ml32m"}:
-        return _load_ml32m(
+    if name in MovielensGraphs.get_valid_datasets():
+        graph = MovielensGraphs(
             root=root,
+            dataset=dataset,
+            device=str(data_device),
+            load_edge_ts=load_edge_ts,
+        )
+        return _load_movielens(
+            graph,
             leave_k=leave_k,
             device=device,
             data_device=data_device,
             rgn=rgn,
-            load_edge_ts=load_edge_ts,
         )
 
-    raise ValueError(f"Dataset desconhecido: '{dataset}'.")
+    raise ValueError(
+        f"Dataset desconhecido: '{dataset}', datasets válidos: {', '.join(MovielensGraphs.get_valid_datasets())}."
+    )
