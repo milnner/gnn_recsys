@@ -83,6 +83,55 @@ def _load_movielens(
     )
 
 
+def _load_movielens(
+    g: Union[MovielensGraphs],
+    leave_k: int,
+    device: torch.device,
+    data_device: torch.device,
+    rgn: Optional[torch.Generator] = None,
+) -> PrepDataset:
+
+    train_idx, test_idx = per_src_leave_k_edges(
+        g.edge_index.to(device),
+        g.num_users,
+        k=leave_k,
+        rgn=rgn,
+    )
+    train_idx = train_idx.to(data_device)
+    test_idx = test_idx.to(data_device)
+
+    hetero_data = g.to_hetero()
+    user_key = "user"
+    item_key = "movie"
+    edge = (user_key, "rates", item_key)
+    rev_edge = (item_key, "rated_by", user_key)
+
+    # Recorta features do item para 1024 dimensões
+    hetero_data[item_key].x = hetero_data[item_key].x[:, :1024].contiguous()
+
+    item_dim = hetero_data[item_key].x.size(-1)
+    has_user_features = (
+        user_key in hetero_data.node_types
+        and hasattr(hetero_data[user_key], "x")
+        and hetero_data[user_key].x is not None
+    )
+    user_dim = hetero_data[user_key].x.size(-1) if has_user_features else item_dim
+
+    return PrepDataset(
+        train_idx=train_idx,
+        test_idx=test_idx,
+        hetero_data=hetero_data,
+        edge=edge,
+        rev_edge=rev_edge,
+        user_key=user_key,
+        item_key=item_key,
+        num_users=g.num_users,
+        num_items=hetero_data[item_key].num_nodes,
+        in_channels_dict={user_key: user_dim, item_key: item_dim},
+        has_user_features=has_user_features,
+    )
+
+
 def get_dataset(
     dataset: str,
     root: Union[str, Path],
