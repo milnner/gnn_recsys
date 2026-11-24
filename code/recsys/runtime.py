@@ -1,4 +1,3 @@
-# recsys/runtime.py
 from dataclasses import dataclass
 import random
 import numpy as np
@@ -28,18 +27,27 @@ def build_runtime(cfg: Config, wandb_mode: str = "disabled") -> Runtime:
         random.seed(cfg.train.seed)
         np.random.seed(cfg.train.seed)
 
+    tags = [
+        tag
+        for tag in [
+            cfg.data.dataset,
+            f"leave_k={cfg.data.leave_k}",
+            cfg.sampler.negative_sampling,
+            (  # Caso o amostrador seja mixed, mostrar o ratio de permutações
+                f"perm_r={cfg.sampler.perm_ratio}"
+                if cfg.sampler.negative_sampling == "mixed"
+                else None
+            ),
+            f"ratio={cfg.sampler.ratio}",
+            f"seed={cfg.train.seed}",
+        ]
+        if tag is not None
+    ]
     wandb_run = wandb.init(
         entity="rs-lp-gnn-xai",
         project="gnn_recsys",
         config=cfg.to_dict(),
-        tags=[
-            cfg.data.dataset,
-            f"k={cfg.eval.k}",
-            cfg.sampler.negative_sampling,
-            f"perm_r={cfg.sampler.perm_ratio}",
-            f"ratio={cfg.sampler.ratio}",
-            f"seed={cfg.train.seed}",
-        ],
+        tags=tags,
         mode=wandb_mode,
     )
 

@@ -10,7 +10,7 @@ from torch_geometric.loader import LinkNeighborLoader
 from tqdm.auto import tqdm
 
 from recsys.config import Config, EarlyStopConfig
-from recsys.eval import evaluate_full_graph
+from recsys.eval import evaluate_full_ranking
 from recsys.runtime import Runtime
 from .sampling import NEGATIVE_SAMPLING
 
@@ -144,10 +144,9 @@ def train(
     full_data: HeteroData | None = None,
     eval_edge_index: Tensor | None = None,
 ) -> dict[str, Any]:
-    user_type, _, item_type = edge
     model = model.to(runtime.device)
 
-    early_stopper = EarlyStopping(cfg.early_stop, k=cfg.eval.k)
+    early_stopper = EarlyStopping(cfg.early_stop, k=cfg.eval.patience_k)
     history: list[dict[str, Any]] = []
 
     epoch_pbar = tqdm(
@@ -187,7 +186,7 @@ def train(
                     "eval_mode='full_graph' exige full_data e eval_edge_index"
                 )
 
-            val_metrics = evaluate_full_graph(
+            val_metrics = evaluate_full_ranking(
                 model=model,
                 data=full_data,
                 edge_type=edge,

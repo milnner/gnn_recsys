@@ -8,7 +8,7 @@ from torch_geometric.loader import LinkNeighborLoader
 from recsys.aggr import aggregate_neighbors
 from recsys.config_io import load_config
 from recsys.data import rebuild_hetero
-from recsys.eval import evaluate_full_graph
+from recsys.eval import evaluate_full_ranking
 from recsys.factories import build_model, build_optimizer
 from recsys.prep_dataset import get_dataset
 from recsys.runtime import build_runtime
@@ -109,27 +109,6 @@ def main() -> None:
             full_data=final_data,
             eval_edge_index=dataset.eval_test_edge_index,
         )
-
-        # 6) Avaliação final
-        test_metrics = evaluate_full_graph(
-            model=model,
-            data=final_data,
-            node_type_user=user_type,
-            node_type_item=item_type,
-            edge_type=dataset.edge,
-            device=runtime.device,
-            k=cfg.eval.k,
-            num_negatives=cfg.eval.num_negatives,
-            eval_edge_index=dataset.eval_test_edge_index,
-            num_neighbors=cfg.eval.num_neighbors,
-            rgn=runtime.rgn,
-            batch_size=cfg.eval.eval_batch_size,
-        )
-
-        if runtime.wandb_run is not None:
-            runtime.wandb_run.log({f"test/{k}": v for k, v in test_metrics.items()})
-
-        logger.info("TESTE: %s", test_metrics)
 
     finally:
         if runtime.wandb_run is not None:

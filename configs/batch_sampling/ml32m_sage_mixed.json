@@ -1,7 +1,7 @@
 {
   "data": {
     "dataset": "ml32m",
-    "root": "/home/milnner00/projects/gnn_recsys/data/ml-32m",
+    "root": "/home/milnner00/projects/gnn_recsys/data/",
     "leave_k": 10,
     "load_edge_ts": false,
     "feature_dim": null
@@ -15,12 +15,12 @@
   "model": {
     "name": "hetero_sage",
     "hidden_channels": 128,
-    "num_layers": 2,
+    "num_layers": 3,
     "dropout": 0.1,
     "hetero_aggr": "mean",
     "conv_aggr": "mean",
     "activation": "relu",
-    "normalize_conv": true,
+    "normalize_conv": false,
     "normalize_output": false,
     "input_proj": true
   },
@@ -39,10 +39,11 @@
     "seed": 42
   },
   "eval": {
-    "k": 10,
+    "ks": [10, 20, 50, 100],
+    "patience_k" : 50,
     "eval_mode": "full_graph",
     "num_neighbors": [50, 25, 15],
-    "num_negatives": 100,
+    "user_batch_size": 4096,
     "eval_batch_size": 4096,
     "eval_every": 1
   },

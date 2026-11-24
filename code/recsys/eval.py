@@ -36,194 +36,69 @@ def _compute_dot_scores_chunked(
 
 
 @torch.no_grad()
-def _sample_negatives_vectorized(
-    unique_users: torch.Tensor,  # [U]
-    counts: torch.Tensor,  # [U] positivos únicos por usuário
-    v_sorted: torch.Tensor,  # [P] itens ordenados por usuário
-    n_items: int,
-    num_negatives: int,
-    device: torch.device,
-    rgn: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Amostra itens negativos de forma 100% vetorizada na GPU (`device`),
-    mesmo que `rgn` tenha sido instanciado na CPU.
-    """
-    unique_users = unique_users.to(device, non_blocking=True)
-    counts = counts.to(device, non_blocking=True)
-    v_sorted = v_sorted.to(device, non_blocking=True)
-
-    U, P = unique_users.numel(), v_sorted.numel()
-    if U == 0:
-        empty = torch.empty((0, num_negatives), dtype=torch.long, device=device)
-        return empty, torch.empty(0, dtype=torch.long, device=device)
-
-    # 1. Hashes lineares (user_local_idx * n_items + item_id) na GPU
-    pos_user_local = torch.repeat_interleave(torch.arange(U, device=device), counts)
-    pos_hashes = (pos_user_local * n_items + v_sorted).sort().values.contiguous()
-
-    margin = min(n_items, max(num_negatives + 32, int(num_negatives * 1.25)))
-
-    # Se o gerador estiver na CPU, sorteia ou usa seed na GPU para não travar a CPU no argsort/searchsorted
-    if rgn is not None and rgn.device != device:
-        # Extrai uma seed determinística do gerador CPU para rodar o randint rápido na GPU
-        seed = int(
-            torch.randint(0, 2**62, (1,), generator=rgn, device=rgn.device).item()
-        )
-        gpu_rgn = torch.Generator(device=device).manual_seed(seed)
-        cand = torch.randint(0, n_items, (U, margin), generator=gpu_rgn, device=device)
-    else:
-        cand = torch.randint(0, n_items, (U, margin), generator=rgn, device=device)
-
-    # 2. Rejeita candidatos que são positivos via torch.searchsorted na GPU
-    if P > 0:
-        cand_hash = (
-            torch.arange(U, device=device).unsqueeze(1) * n_items + cand
-        ).reshape(-1)
-        idx = torch.searchsorted(pos_hashes, cand_hash).clamp_(max=P - 1)
-        is_pos = (pos_hashes[idx] == cand_hash).view(U, margin)
-        del cand_hash, idx
-    else:
-        is_pos = torch.zeros((U, margin), dtype=torch.bool, device=device)
-    valid = ~is_pos
-    del is_pos
-
-    # 3. Deduplicação intra-linha na GPU
-    sort_idx = cand.argsort(dim=1)
-    cand_sorted = cand.gather(1, sort_idx)
-    first_occ = torch.ones((U, margin), dtype=torch.bool, device=device)
-    first_occ[:, 1:] = cand_sorted[:, 1:] != cand_sorted[:, :-1]
-    del cand_sorted
-    valid.scatter_(1, sort_idx, first_occ & valid.gather(1, sort_idx))
-    del sort_idx, first_occ
-
-    # 4. Seleciona até `max_neg` candidatos válidos por usuário
-    max_neg = (n_items - counts).clamp_(min=0, max=num_negatives)
-    cumsum = valid.cumsum(dim=1)
-    keep = valid & (cumsum <= max_neg.unsqueeze(1))
-
-    negs = torch.full((U, num_negatives), -1, dtype=torch.long, device=device)
-    rows, _ = keep.nonzero(as_tuple=True)
-    negs[rows, cumsum[keep] - 1] = cand[keep]
-    del cand, valid, cumsum, rows
-
-    # 5. Fallback para casos extremos
-    n_filled = keep.sum(dim=1)
-    incomplete_users = (n_filled < max_neg).nonzero(as_tuple=True)[0]
-    if incomplete_users.numel() > 0:
-        starts = torch.cat(
-            [torch.zeros(1, dtype=torch.long, device=device), counts.cumsum(0)[:-1]]
-        )
-        for u in incomplete_users.tolist():
-            n_have = int(n_filled[u].item())
-            n_need = int(max_neg[u].item()) - n_have
-            u_pos = v_sorted[starts[u] : starts[u] + counts[u]]
-
-            avail_mask = torch.ones(n_items, dtype=torch.bool, device=device)
-            avail_mask[u_pos] = False
-            if n_have > 0:
-                avail_mask[negs[u, :n_have]] = False
-
-            avail_items = avail_mask.nonzero(as_tuple=True)[0]
-            perm = torch.randperm(avail_items.numel(), device=device)[:n_need]
-            negs[u, n_have : n_have + n_need] = avail_items[perm]
-
-    return negs, max_neg
-
-
-@torch.no_grad()
 def _compute_metrics_and_topk(
-    scores: torch.Tensor,
-    target: torch.Tensor,
-    user_ids: torch.Tensor,
-    item_ids: torch.Tensor,
-    k: int,
-) -> Tuple[float, float, float, float, torch.Tensor]:
+    topk_items: torch.Tensor,  # [B, max_k]
+    hits: torch.Tensor,  # [B, max_k] float (0.0 ou 1.0)
+    n_pos: torch.Tensor,  # [B] total de positivos do usuário na avaliação
+    popularity: torch.Tensor,  # [n_items] distribuição de popularidade no treino
+    ks: List[int],
+    n_items: int,
+    ranks: torch.Tensor,  # [max_k] 1..max_k
+    disc: torch.Tensor,  # [max_k] 1 / log2(rank + 1)
+    cum_disc: torch.Tensor,  # [max_k + 1] IDCG lookup
+    seen_in_topk: Dict[int, torch.Tensor],  # {k: bool[n_items]} atualizado in-place
+) -> Dict[int, Dict[str, float]]:
     """
-    Calcula NDCG@k, MRR@k, Recall@k, MAP@k e extrai os itens Top-K na GPU.
+    Calcula as somas das métricas de ranking (NDCG, MRR, Recall, MAP) e Novelty
+    para múltiplos valores de k em um batch de usuários, atualizando Coverage in-place.
     """
-    dev = scores.device
-    N = scores.numel()
-    if N == 0:
-        return 0.0, 0.0, 0.0, 0.0, torch.empty(0, dtype=torch.long, device=dev)
+    n_pos_clamped = n_pos.clamp(min=1.0)
 
-    # Ordenação composta (user_ids ASC, scores DESC)
-    order_score = scores.argsort(descending=True, stable=True)
-    order_user = user_ids[order_score].argsort(stable=True)
-    fo = order_score[order_user]
-    del order_score, order_user
+    # Acumulados ao longo do eixo de rank (calculados 1x para todos os ks)
+    hits_cum = hits.cumsum(dim=1)
+    dcg_cum = (hits * disc).cumsum(dim=1)
+    ap_cum = ((hits_cum / ranks) * hits).cumsum(dim=1)
 
-    t_s = target[fo]
-    u_s = user_ids[fo]
-    v_s = item_ids[fo]
-    del fo
+    has_hit_max = hits.any(dim=1)
+    first_rank = hits.argmax(dim=1)  # 0-based
 
-    uniq_u, cts = torch.unique_consecutive(u_s, return_counts=True)
-    U = uniq_u.numel()
-    del u_s, uniq_u
+    p = popularity[topk_items]
+    valid_p = p > 0
+    nov_vals = torch.where(valid_p, -torch.log2(p.clamp(min=1e-12)), 0.0)
+    nov_cum = nov_vals.cumsum(dim=1)
+    valid_p_cum = valid_p.cumsum(dim=1)
 
-    starts = torch.cat(
-        [torch.zeros(1, dtype=torch.long, device=dev), cts.cumsum(0)[:-1]]
-    )
-    gid = torch.repeat_interleave(torch.arange(U, device=dev), cts)
-    rank = torch.arange(N, device=dev) - torch.repeat_interleave(starts, cts)
+    batch_stats: Dict[int, Dict[str, float]] = {}
 
-    in_topk_mask = rank < k
-    topk_items = v_s[in_topk_mask]
-    del v_s
+    for k in ks:
+        k_eff = min(k, n_items)
+        idx = k_eff - 1
 
-    is_pos = (t_s > 0).float()
-    del t_s
-    in_topk_pos = is_pos * in_topk_mask.float()
+        idcg = cum_disc[n_pos.clamp(max=k_eff).long()]
+        ndcg = (dcg_cum[:, idx] / idcg.clamp(min=1e-9)).sum().item()
 
-    # Total de positivos por usuário
-    n_pos_user = torch.zeros(U, device=dev).scatter_add_(0, gid, is_pos)
-    n_pos_clamped = n_pos_user.clamp(min=1.0)
+        has_hit_k = has_hit_max & (first_rank < k_eff)
+        mrr = torch.where(has_hit_k, 1.0 / (first_rank.float() + 1.0), 0.0).sum().item()
 
-    # 1. NDCG@k
-    disc = torch.where(
-        in_topk_mask, 1.0 / torch.log2(rank.float() + 2.0), torch.zeros_like(is_pos)
-    )
-    dcg_user = torch.zeros(U, device=dev).scatter_add_(0, gid, disc * is_pos)
-    del disc, in_topk_mask
+        recall = (hits_cum[:, idx] / n_pos_clamped).sum().item()
 
-    ideal_ranks = torch.arange(k, device=dev, dtype=torch.float)
-    ideal_disc = 1.0 / torch.log2(ideal_ranks + 2.0)
-    cum_disc = torch.cat([torch.zeros(1, device=dev), ideal_disc.cumsum(0)])
-    idcg_user = cum_disc[n_pos_user.clamp(max=k).long()]
+        denom_map = n_pos_clamped.clamp(max=float(k_eff))
+        mapk = (ap_cum[:, idx] / denom_map).sum().item()
 
-    ndcg = (dcg_user / idcg_user.clamp(min=1e-9)).mean().item()
+        seen_in_topk[k][topk_items[:, :k_eff].reshape(-1)] = True
+        nov_sum = nov_cum[:, idx].sum().item()
+        nov_cnt = float(valid_p_cum[:, idx].sum().item())
 
-    # 2. MRR@k
-    inf_tensor = torch.tensor(float("inf"), device=dev)
-    pos_ranks = torch.where(in_topk_pos > 0, rank.float(), inf_tensor)
-    first_pos = torch.full((U,), float("inf"), device=dev).scatter_reduce_(
-        0, gid, pos_ranks, reduce="amin", include_self=True
-    )
-    del pos_ranks
-    mrr = (
-        torch.where(torch.isfinite(first_pos), 1.0 / (first_pos + 1.0), 0.0)
-        .mean()
-        .item()
-    )
+        batch_stats[k] = {
+            "ndcg": ndcg,
+            "mrr": mrr,
+            "recall": recall,
+            "map": mapk,
+            "novelty_sum": nov_sum,
+            "novelty_count": nov_cnt,
+        }
 
-    # 3. Recall@k
-    hits_user = torch.zeros(U, device=dev).scatter_add_(0, gid, in_topk_pos)
-    recall = (hits_user / n_pos_clamped).mean().item()
-
-    # 4. MAP@k
-    cs = is_pos.cumsum(0)
-    cs_offset = cs - is_pos
-    user_cs_start = cs_offset[starts]
-    pos_cum_per_user = cs - torch.repeat_interleave(user_cs_start, cts)
-    del cs, cs_offset, user_cs_start
-
-    prec_at_k = (pos_cum_per_user / (rank.float() + 1.0)) * in_topk_pos
-    ap_user = torch.zeros(U, device=dev).scatter_add_(0, gid, prec_at_k)
-    denom_map = torch.minimum(n_pos_clamped, torch.tensor(float(k), device=dev))
-    mapk = (ap_user / denom_map).mean().item()
-
-    return ndcg, mrr, recall, mapk, topk_items
+    return batch_stats
 
 
 @torch.no_grad()
@@ -267,22 +142,166 @@ def get_seed_embeddings(
 
 
 @torch.no_grad()
-def evaluate_full_graph(
+def _sample_negatives_vectorized(
+    unique_users: torch.Tensor,  # [U] IDs globais dos usuários avaliados
+    exclude_hashes: torch.Tensor,  # [E] hashes (u * n_items + v) ordenados e únicos (treino + eval)
+    n_items: int,
+    num_negatives: int,
+    device: torch.device,
+    rgn: Optional[torch.Generator] = None,
+    item_probs: Optional[
+        torch.Tensor
+    ] = None,  # [n_items] distribuição para amostragem por popularidade
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Amostra itens negativos 100% na GPU, rejeitando todas as interações em `exclude_hashes`
+    (treino + avaliação). Suporta amostragem uniforme ou por popularidade (`item_probs`).
+    """
+    unique_users = unique_users.to(device, non_blocking=True)
+    exclude_hashes = exclude_hashes.to(device, non_blocking=True)
+
+    U = unique_users.numel()
+    E = exclude_hashes.numel()
+    if U == 0:
+        empty = torch.empty((0, num_negatives), dtype=torch.long, device=device)
+        return empty, torch.empty(0, dtype=torch.long, device=device)
+
+    # 1. Intervalo [low, high) de itens excluídos para cada usuário em `exclude_hashes`
+    if E > 0:
+        low = torch.searchsorted(exclude_hashes, unique_users * n_items, right=False)
+        high = torch.searchsorted(
+            exclude_hashes, (unique_users + 1) * n_items, right=False
+        )
+        excl_counts = high - low
+    else:
+        low = torch.zeros(U, dtype=torch.long, device=device)
+        high = torch.zeros(U, dtype=torch.long, device=device)
+        excl_counts = torch.zeros(U, dtype=torch.long, device=device)
+
+    # Margem maior para popularidade, pois há mais colisões (itens repetidos e positivos de treino)
+    if item_probs is not None:
+        margin = min(n_items, max(num_negatives + 64, int(num_negatives * 2.0)))
+    else:
+        margin = min(n_items, max(num_negatives + 32, int(num_negatives * 1.25)))
+
+    # Garante gerador na GPU para não travar a CPU
+    if rgn is not None and rgn.device != device:
+        seed = int(
+            torch.randint(0, 2**62, (1,), generator=rgn, device=rgn.device).item()
+        )
+        gen = torch.Generator(device=device).manual_seed(seed)
+    else:
+        gen = rgn
+
+    # 2. Sorteio dos candidatos (uniforme ou por popularidade via CDF + searchsorted)
+    if item_probs is not None:
+        probs = item_probs.to(device=device, dtype=torch.float32, non_blocking=True)
+        cdf = probs.cumsum(dim=0)
+        cdf[-1] = 1.0  # evita erro de arredondamento no limite superior
+        rand_vals = torch.rand((U, margin), generator=gen, device=device)
+        cand = torch.searchsorted(cdf, rand_vals).clamp_(max=n_items - 1)
+        del cdf, rand_vals
+    else:
+        cand = torch.randint(0, n_items, (U, margin), generator=gen, device=device)
+
+    # 3. Rejeita candidatos que pertencem a treino ou avaliação
+    if E > 0:
+        cand_hash = (unique_users.unsqueeze(1) * n_items + cand).reshape(-1)
+        idx = torch.searchsorted(exclude_hashes, cand_hash).clamp_(max=E - 1)
+        is_excl = (exclude_hashes[idx] == cand_hash).view(U, margin)
+        del cand_hash, idx
+    else:
+        is_excl = torch.zeros((U, margin), dtype=torch.bool, device=device)
+    valid = ~is_excl
+    del is_excl
+
+    # 4. Deduplicação intra-linha na GPU
+    sort_idx = cand.argsort(dim=1)
+    cand_sorted = cand.gather(1, sort_idx)
+    first_occ = torch.ones((U, margin), dtype=torch.bool, device=device)
+    first_occ[:, 1:] = cand_sorted[:, 1:] != cand_sorted[:, :-1]
+    del cand_sorted
+    valid.scatter_(1, sort_idx, first_occ & valid.gather(1, sort_idx))
+    del sort_idx, first_occ
+
+    # 5. Seleciona até `max_neg` candidatos válidos por usuário
+    max_neg = (n_items - excl_counts).clamp_(min=0, max=num_negatives)
+    cumsum = valid.cumsum(dim=1)
+    keep = valid & (cumsum <= max_neg.unsqueeze(1))
+
+    negs = torch.full((U, num_negatives), -1, dtype=torch.long, device=device)
+    rows, _ = keep.nonzero(as_tuple=True)
+    negs[rows, cumsum[keep] - 1] = cand[keep]
+    del cand, valid, cumsum, rows
+
+    # 6. Fallback para usuários que não atingiram `max_neg`
+    n_filled = keep.sum(dim=1)
+    incomplete_users = (n_filled < max_neg).nonzero(as_tuple=True)[0]
+    if incomplete_users.numel() > 0:
+        for u in incomplete_users.tolist():
+            n_have = int(n_filled[u].item())
+            n_need = int(max_neg[u].item()) - n_have
+
+            avail_mask = torch.ones(n_items, dtype=torch.bool, device=device)
+            if high[u] > low[u]:
+                u_excl_items = exclude_hashes[low[u] : high[u]] % n_items
+                avail_mask[u_excl_items] = False
+            if n_have > 0:
+                avail_mask[negs[u, :n_have]] = False
+
+            avail_items = avail_mask.nonzero(as_tuple=True)[0]
+            if item_probs is not None:
+                avail_probs = probs[avail_items]
+                if avail_probs.sum() > 0:
+                    chosen_idx = torch.multinomial(
+                        avail_probs,
+                        num_samples=n_need,
+                        replacement=False,
+                        generator=gen,
+                    )
+                else:
+                    chosen_idx = torch.randperm(
+                        avail_items.numel(), generator=gen, device=device
+                    )[:n_need]
+            else:
+                chosen_idx = torch.randperm(
+                    avail_items.numel(), generator=gen, device=device
+                )[:n_need]
+
+            negs[u, n_have : n_have + n_need] = avail_items[chosen_idx]
+
+    return negs, max_neg
+
+
+@torch.no_grad()
+def evaluate_full_ranking(
     model: torch.nn.Module,
     data: HeteroData,
     edge_type: tuple[str, str, str],
     eval_cfg: EvalConfig,
     runtime: Runtime,
     eval_edge_index: Optional[torch.Tensor] = None,
-    score_chunk_size: int = 2_000_000,
     verbose: bool = True,
 ) -> Dict[str, float]:
     node_type_user, _, node_type_item = edge_type
     device = runtime.device
-    k = eval_cfg.k
+    ks = sorted(set(eval_cfg.ks))
+    if not ks or ks[0] <= 0:
+        raise ValueError(
+            f"eval_cfg.ks deve conter inteiros positivos, recebido: {eval_cfg.ks}"
+        )
+    # print(model.__class__.__name__)
+    # print(data.node_types)
+    # print(node_type_user)
+    # print(eval_cfg.num_neighbors)
+    # print(device)
+    # print(eval_cfg.eval_batch_size)
+    if eval_cfg.eval_batch_size == None:
+        raise ValueError(
+            "eval_cfg.eval_batch_size=None, para fazer aavaliação é necessário entrar com um inteiro para o batch"
+        )
 
     model.eval()
-
     t0 = time.perf_counter()
     user_emb = get_seed_embeddings(
         model,
@@ -308,94 +327,145 @@ def evaluate_full_graph(
         print(f"[eval] item_emb: {time.perf_counter() - t0:.2f}s", flush=True)
 
     t0 = time.perf_counter()
-    if eval_edge_index is None:
-        eval_edge_index = data[edge_type].edge_index
-
+    train_ei = data[edge_type].edge_index.to(device, non_blocking=True)
+    mask_train = eval_edge_index is not None
+    eval_ei = (
+        train_ei
+        if eval_edge_index is None
+        else eval_edge_index.to(device, non_blocking=True)
+    )
     n_items = data[node_type_item].num_nodes
+    max_k = min(ks[-1], n_items)
 
-    # 1. Popularidade dos itens na GPU
-    train_items = data[edge_type].edge_index[1].to(device, non_blocking=True)
-    item_pop = degree(train_items, num_nodes=n_items, dtype=torch.float)
+    # 1. Popularidade dos itens no treino (para Novelty)
+    item_pop = degree(train_ei[1], num_nodes=n_items, dtype=torch.float)
     popularity = item_pop / item_pop.sum().clamp(min=1.0)
-    del train_items, item_pop
+    del item_pop
 
-    # 2. Ordenação e deduplicação de arestas positivas (u, v) na GPU
-    eval_ei = eval_edge_index.to(device, non_blocking=True)
-    edge_hashes = eval_ei[0] * n_items + eval_ei[1]
+    # 2. Arestas de avaliação ordenadas e deduplicadas
+    eval_hashes = torch.unique(eval_ei[0] * n_items + eval_ei[1], sorted=True)
+    eval_u = torch.div(eval_hashes, n_items, rounding_mode="floor")
     del eval_ei
-    unique_hashes = torch.unique(edge_hashes, sorted=True)
-    del edge_hashes
-    u_sorted = torch.div(unique_hashes, n_items, rounding_mode="floor")
-    v_sorted = unique_hashes % n_items
-    del unique_hashes
 
-    unique_users, counts = torch.unique_consecutive(u_sorted, return_counts=True)
+    unique_users, eval_counts = torch.unique_consecutive(eval_u, return_counts=True)
+    del eval_u
+    U = unique_users.numel()
 
-    # 3. Amostragem 100% na GPU
-    negs, _ = _sample_negatives_vectorized(
-        unique_users=unique_users,
-        counts=counts,
-        v_sorted=v_sorted,
-        n_items=n_items,
-        num_negatives=eval_cfg.num_negatives,
-        device=device,
-        rgn=runtime.rgn,
+    if U == 0:
+        return {
+            f"{m}@{k}": 0.0
+            for k in ks
+            for m in ("ndcg", "mrr", "map", "recall", "coverage", "novelty")
+        }
+
+    eval_starts = torch.cat(
+        [torch.zeros(1, dtype=torch.long, device=device), eval_counts.cumsum(0)[:-1]]
     )
-    valid_neg_mask = negs >= 0
 
-    # 4. Construção direta dos tensores flat (positivos + negativos) na GPU
-    u_neg = unique_users.unsqueeze(1).expand_as(negs)[valid_neg_mask]
-    v_neg = negs[valid_neg_mask]
-    del negs, valid_neg_mask, unique_users, counts
-
-    n_pos = v_sorted.numel()
-    n_neg = v_neg.numel()
-
-    u_flat = torch.cat([u_sorted, u_neg])
-    cand_flat = torch.cat([v_sorted, v_neg])
-    del u_sorted, v_sorted, u_neg, v_neg
-
-    # 5. Cálculo de scores em chunks para não estourar VRAM, liberando user_emb e item_emb logo em seguida
-    scores = _compute_dot_scores_chunked(
-        user_emb=user_emb,
-        item_emb=item_emb,
-        u_flat=u_flat,
-        cand_flat=cand_flat,
-        chunk_size=score_chunk_size,
-    )
-    del user_emb, item_emb
-
-    target = torch.empty(n_pos + n_neg, dtype=torch.float, device=device)
-    target[:n_pos] = 1.0
-    target[n_pos:] = 0.0
-
-    # 6. Métricas de ranking e Top-K unificados na GPU
-    ndcg, mrr, recall, mapk, topk_cat = _compute_metrics_and_topk(
-        scores=scores,
-        target=target,
-        user_ids=u_flat,
-        item_ids=cand_flat,
-        k=k,
-    )
-    del scores, target, u_flat, cand_flat
-
-    # 7. Coverage & Novelty na GPU
-    if topk_cat.numel() > 0:
-        coverage = topk_cat.unique().numel() / n_items
-        p = popularity[topk_cat]
-        valid_p = p > 0
-        novelty = (-torch.log2(p[valid_p])).mean().item() if valid_p.any() else 0.0
+    # 3. Ordena arestas de treino por usuário para máscara rápida por batch
+    if mask_train and train_ei.numel() > 0:
+        train_order = train_ei[0].argsort()
+        train_u = train_ei[0, train_order].contiguous()
+        train_v = train_ei[1, train_order].contiguous()
+        del train_order
     else:
-        coverage, novelty = 0.0, 0.0
+        train_u = torch.empty(0, dtype=torch.long, device=device)
+        train_v = torch.empty(0, dtype=torch.long, device=device)
+    del train_ei
+
+    # Constantes pré-calculadas para _compute_metrics_and_topk
+    ranks = torch.arange(1, max_k + 1, device=device, dtype=torch.float)
+    disc = 1.0 / torch.log2(ranks + 1.0)
+    cum_disc = torch.cat([torch.zeros(1, device=device), disc.cumsum(0)])
+
+    item_emb_t = item_emb.T.contiguous()
+    del item_emb
+
+    # Acumuladores globais
+    totals: Dict[int, Dict[str, float]] = {
+        k: {
+            "ndcg": 0.0,
+            "mrr": 0.0,
+            "recall": 0.0,
+            "map": 0.0,
+            "novelty_sum": 0.0,
+            "novelty_count": 0.0,
+        }
+        for k in ks
+    }
+    seen_in_topk = {
+        k: torch.zeros(n_items, dtype=torch.bool, device=device) for k in ks
+    }
+
+    # 4. Loop em batches de usuários na GPU
+    for b_start in range(0, U, eval_cfg.user_batch_size):
+        b_end = min(b_start + eval_cfg.user_batch_size, U)
+        batch_u = unique_users[b_start:b_end]
+        B = batch_u.numel()
+
+        scores = user_emb[batch_u] @ item_emb_t
+
+        # Mascara itens de treino com -inf
+        if mask_train and train_u.numel() > 0:
+            t_low = int(torch.searchsorted(train_u, batch_u[0], right=False).item())
+            t_high = int(torch.searchsorted(train_u, batch_u[-1], right=True).item())
+            if t_high > t_low:
+                tu = train_u[t_low:t_high]
+                tv = train_v[t_low:t_high]
+                local_u = torch.searchsorted(batch_u, tu).clamp_(max=B - 1)
+                in_batch = batch_u[local_u] == tu
+                scores[local_u[in_batch], tv[in_batch]] = float("-inf")
+
+        _, topk_items = torch.topk(scores, k=max_k, dim=1, largest=True, sorted=True)
+        del scores
+
+        # Verifica hits contra os positivos do batch
+        e_start = int(eval_starts[b_start].item())
+        e_end = int((eval_starts[b_end - 1] + eval_counts[b_end - 1]).item())
+        batch_eval_hashes = eval_hashes[e_start:e_end]
+
+        topk_hashes = (batch_u.unsqueeze(1) * n_items + topk_items).reshape(-1)
+        pos_idx = torch.searchsorted(batch_eval_hashes, topk_hashes).clamp_(
+            max=batch_eval_hashes.numel() - 1
+        )
+        hits = (batch_eval_hashes[pos_idx] == topk_hashes).view(B, max_k).float()
+        del topk_hashes, pos_idx
+
+        batch_stats = _compute_metrics_and_topk(
+            topk_items=topk_items,
+            hits=hits,
+            n_pos=eval_counts[b_start:b_end].float(),
+            popularity=popularity,
+            ks=ks,
+            n_items=n_items,
+            ranks=ranks,
+            disc=disc,
+            cum_disc=cum_disc,
+            seen_in_topk=seen_in_topk,
+        )
+
+        for k in ks:
+            for key, val in batch_stats[k].items():
+                totals[k][key] += val
+
+    del user_emb, item_emb_t, eval_hashes, train_u, train_v
 
     if verbose:
-        print(f"[eval] metrics & sampling: {time.perf_counter() - t0:.2f}s", flush=True)
+        print(
+            f"[eval] full-ranking ({U} users, ks={ks}): {time.perf_counter() - t0:.2f}s",
+            flush=True,
+        )
 
-    return {
-        f"ndcg@{k}": ndcg,
-        f"mrr@{k}": mrr,
-        f"map@{k}": mapk,
-        f"recall@{k}": recall,
-        "coverage": coverage,
-        "novelty": novelty,
-    }
+    metrics: Dict[str, float] = {}
+    for k in ks:
+        t = totals[k]
+        metrics[f"ndcg@{k}"] = t["ndcg"] / U
+        metrics[f"mrr@{k}"] = t["mrr"] / U
+        metrics[f"map@{k}"] = t["map"] / U
+        metrics[f"recall@{k}"] = t["recall"] / U
+        metrics[f"coverage@{k}"] = seen_in_topk[k].sum().item() / n_items
+        metrics[f"novelty@{k}"] = (
+            t["novelty_sum"] / t["novelty_count"] if t["novelty_count"] > 0 else 0.0
+        )
+
+    return metrics
