@@ -43,7 +43,14 @@ def build_runtime(cfg: Config, wandb_mode: str = "disabled") -> Runtime:
         ]
         if tag is not None
     ]
+
+    if cfg.sampler.negative_sampling == "mixed":
+        run_name = f"{cfg.data.dataset}-{cfg.model.name}-{cfg.sampler.negative_sampling}-ratio={cfg.sampler.ratio}-perm_ratio={cfg.sampler.perm_ratio}"
+    else:
+        run_name = f"{cfg.data.dataset}-{cfg.model.name}-{cfg.sampler.negative_sampling}-ratio={cfg.sampler.ratio}"
+
     wandb_run = wandb.init(
+        name=run_name,
         entity="rs-lp-gnn-xai",
         project="gnn_recsys",
         config=cfg.to_dict(),
