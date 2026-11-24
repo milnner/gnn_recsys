@@ -32,7 +32,7 @@
     "grad_clip": 5.0
   },
   "train": {
-    "batch_size": 90000,
+    "batch_size": 16384,
     "num_epochs": 1000,
     "l2_reg": 0.0001,
     "num_workers": 4,
