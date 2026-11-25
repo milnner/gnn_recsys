@@ -17,8 +17,10 @@ from .sampling import NEGATIVE_SAMPLING
 logger = logging.getLogger(__name__)
 
 
-def _bpr_per_triple(pos_scores: Tensor, neg_scores: Tensor) -> Tensor:
-    diff = pos_scores.unsqueeze(1) - neg_scores  # [P, R]
+def _bpr_per_triple(
+    pos_scores: Tensor, neg_scores: Tensor, score_scale: float
+) -> Tensor:
+    diff = (pos_scores.unsqueeze(1) - neg_scores) * score_scale  # [P, R]
     return -F.logsigmoid(diff).mean()
 
 
@@ -116,10 +118,12 @@ def _train_one_epoch(
         pos_scores = (u_emb * v_pos_emb).sum(dim=-1)  # [P]
         neg_scores = torch.einsum("pd,prd->pr", u_emb, v_neg_emb)  # [P, R]
 
-        loss = _bpr_per_triple(pos_scores, neg_scores)
+        loss = _bpr_per_triple(pos_scores, neg_scores, cfg.train.score_scale)
         if cfg.train.l2_reg > 0:
             reg = (
-                u_emb.pow(2).sum() + v_pos_emb.pow(2).sum() + v_neg_emb.pow(2).sum()
+                u_emb.pow(2).sum()
+                + v_pos_emb.pow(2).sum()
+                + v_neg_emb.pow(2).sum() / cfg.sampler.ratio
             ) / num_pos
             loss = loss + cfg.train.l2_reg * reg
 

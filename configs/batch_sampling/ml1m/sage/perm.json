@@ -36,7 +36,8 @@
     "num_epochs": 1000,
     "l2_reg": 0.0001,
     "num_workers": 4,
-    "seed": 42
+    "seed": 42,
+    "score_scale": 10.0
   },
   "eval": {
     "ks": [10, 20, 50, 100],

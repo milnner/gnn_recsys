@@ -51,6 +51,7 @@ class TrainConfig:
     # bpr_reduction: Literal["mean_triples", "mean_positives"] = "mean_positives"
     num_workers: int
     seed: int
+    score_scale: int
 
 
 @dataclass
