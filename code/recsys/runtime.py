@@ -40,6 +40,8 @@ def build_runtime(cfg: Config, wandb_mode: str = "disabled") -> Runtime:
             ),
             f"ratio={cfg.sampler.ratio}",
             f"seed={cfg.train.seed}",
+            f"norm_o={cfg.model.normalize_output}",
+            f"filter_fn={cfg.sampler.filter_false_negatives}",
         ]
         if tag is not None
     ]
