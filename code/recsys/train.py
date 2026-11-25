@@ -12,16 +12,31 @@ from tqdm.auto import tqdm
 from recsys.config import Config, EarlyStopConfig
 from recsys.eval import evaluate_full_ranking
 from recsys.runtime import Runtime
-from .sampling import NEGATIVE_SAMPLING
+from .sampling import NEGATIVE_SAMPLING, build_global_pos_keys
 
 logger = logging.getLogger(__name__)
 
 
 def _bpr_per_triple(
-    pos_scores: Tensor, neg_scores: Tensor, score_scale: float
+    pos_scores: Tensor,
+    neg_scores: Tensor,
+    score_scale: float,
+    fn_mask: Tensor | None = None,
+    reduction: str = "mean_triples",
 ) -> Tensor:
     diff = (pos_scores.unsqueeze(1) - neg_scores) * score_scale  # [P, R]
-    return -F.logsigmoid(diff).mean()
+    loss_mat = -F.logsigmoid(diff)
+    if fn_mask is None:
+        return loss_mat.mean()
+
+    valid = ~fn_mask
+    if reduction == "mean_positives":
+        valid_per_pos = valid.sum(dim=1)  # [P]
+        has_valid = valid_per_pos > 0
+        per_pos_loss = (loss_mat * valid).sum(dim=1) / valid_per_pos.clamp_min(1)
+        return (per_pos_loss * has_valid).sum() / has_valid.sum().clamp_min(1)
+
+    return (loss_mat * valid).sum() / valid.sum().clamp_min(1)
 
 
 class EarlyStopping:
@@ -72,13 +87,17 @@ def _train_one_epoch(
     cfg: Config,
     runtime: Runtime,
     epoch: int,
-) -> float:
+    global_pos_keys: Tensor | None = None,
+    num_total_items: int | None = None,
+) -> tuple[float, float | None]:
     user_type, _, item_type = edge
     sampler_fn = NEGATIVE_SAMPLING[cfg.sampler.negative_sampling]
     ratio = cfg.sampler.ratio
 
     model.train()
     total_loss_t = torch.zeros(1, device=runtime.device)
+    total_fn_t = torch.zeros(1, device=runtime.device)
+
     n_batches = 0
 
     batch_pbar = tqdm(
@@ -94,13 +113,29 @@ def _train_one_epoch(
         batch = batch.to(runtime.device, non_blocking=True)
         opt.zero_grad(set_to_none=True)
 
+        filter_fn = bool(cfg.sampler.filter_false_negatives)
+
         if cfg.sampler.negative_sampling == "mixed":
-            edge_label_index, _ = sampler_fn(
-                batch, edge, ratio, cfg.sampler.perm_ratio, runtime.rgn
+            edge_label_index, fn_mask = sampler_fn(
+                batch,
+                edge,
+                ratio,
+                cfg.sampler.perm_ratio,
+                runtime.rgn,
+                filter_false_negatives=filter_fn,
+                global_pos_keys=global_pos_keys,
+                num_total_items=num_total_items,
             )
         else:
-            edge_label_index, _ = sampler_fn(batch, edge, ratio, runtime.rgn)
-
+            edge_label_index, fn_mask = sampler_fn(
+                batch,
+                edge,
+                ratio,
+                runtime.rgn,
+                filter_false_negatives=filter_fn,
+                global_pos_keys=global_pos_keys,
+                num_total_items=num_total_items,
+            )
         u, v = edge_label_index
         num_pos = u.numel() // (1 + ratio)
         if num_pos == 0:
@@ -118,7 +153,13 @@ def _train_one_epoch(
         pos_scores = (u_emb * v_pos_emb).sum(dim=-1)  # [P]
         neg_scores = torch.einsum("pd,prd->pr", u_emb, v_neg_emb)  # [P, R]
 
-        loss = _bpr_per_triple(pos_scores, neg_scores, cfg.train.score_scale)
+        loss = _bpr_per_triple(
+            pos_scores,
+            neg_scores,
+            cfg.train.score_scale,
+            fn_mask=fn_mask,
+            reduction=cfg.train.bpr_reduction,
+        )
         if cfg.train.l2_reg > 0:
             reg = (
                 u_emb.pow(2).sum()
@@ -133,9 +174,17 @@ def _train_one_epoch(
         opt.step()
 
         total_loss_t += loss.detach()
+        if fn_mask is not None:
+            total_fn_t += fn_mask.float().mean()
         n_batches += 1
 
-    return total_loss_t.item() / max(n_batches, 1)
+    avg_loss = total_loss_t.item() / max(n_batches, 1)
+    avg_fn_rate = (
+        total_fn_t.item() / max(n_batches, 1)
+        if cfg.sampler.filter_false_negatives
+        else None
+    )
+    return avg_loss, avg_fn_rate
 
 
 def train(
@@ -160,8 +209,17 @@ def train(
         dynamic_ncols=True,
     )
 
+    global_pos_keys = None
+    num_total_items = None
+    if cfg.sampler.filter_false_negatives and full_data is not None:
+        _, _, item_type = edge
+        num_total_items = full_data[item_type].num_nodes
+        global_pos_keys = build_global_pos_keys(
+            full_data[edge].edge_index, num_total_items, runtime.device
+        )
+
     for epoch in epoch_pbar:
-        avg_loss = _train_one_epoch(
+        avg_loss, avg_fn_rate = _train_one_epoch(
             train_loader=train_loader,
             model=model,
             opt=opt,
@@ -169,6 +227,8 @@ def train(
             cfg=cfg,
             runtime=runtime,
             epoch=epoch,
+            global_pos_keys=global_pos_keys,
+            num_total_items=num_total_items,
         )
 
         if not math.isfinite(avg_loss):
@@ -179,6 +239,9 @@ def train(
             break
 
         log_dict: dict[str, Any] = {"epoch": epoch, "loss": avg_loss}
+        if avg_fn_rate is not None:
+            log_dict["fn_rate"] = avg_fn_rate
+
         should_eval = (epoch % cfg.eval.eval_every == 0) or (
             epoch == cfg.train.num_epochs
         )

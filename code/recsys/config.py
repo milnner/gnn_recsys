@@ -47,8 +47,7 @@ class TrainConfig:
     batch_size: int
     num_epochs: int
     l2_reg: float
-    # [TODO] reimplementar a lógia de bpr_reduction para quando experimentar a remoção dos falso negativos.
-    # bpr_reduction: Literal["mean_triples", "mean_positives"] = "mean_positives"
+    bpr_reduction: Literal["mean_triples", "mean_positives"]
     num_workers: int
     seed: int
     score_scale: int
