@@ -14,6 +14,7 @@ from recsys.config_io import save_config
 class Runtime:
     device: torch.device
     data_device: torch.device
+    run_dir: Path
     rgn: torch.Generator | None
     wandb_run: wandb.Run | None = None
 
@@ -27,7 +28,7 @@ def build_runtime(
 ) -> Runtime:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data_device = torch.device("cpu")
-    run_dir: Path
+
     rgn = None
     if cfg.train.seed is not None:
         rgn = torch.Generator(device=device).manual_seed(cfg.train.seed)
