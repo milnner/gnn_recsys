@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
         help="Diretório base onde a pasta da execução será criada.",
     )
     parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Caminho para o checkpoint last.pt ou pasta da run para retomar o treino.",
+    )
+    parser.add_argument(
         "--wandb-mode",
         type=str,
         default="disabled",
