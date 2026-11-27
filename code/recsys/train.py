@@ -1,6 +1,7 @@
 import logging
 import math
 from typing import Any
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,30 @@ from recsys.runtime import Runtime
 from .sampling import NEGATIVE_SAMPLING, build_global_pos_keys
 
 logger = logging.getLogger(__name__)
+
+
+def _save_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    opt: torch.optim.Optimizer,
+    epoch: int,
+    best_metric: float,
+    early_stop_counter: int,
+    wandb_run_id: str | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": opt.state_dict(),
+        "best_metric": best_metric,
+        "early_stop_counter": early_stop_counter,
+        "wandb_run_id": wandb_run_id,
+        "metrics": metrics or {},
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
 
 
 def _bpr_per_triple(
@@ -49,7 +74,14 @@ class EarlyStopping:
         self.best_state: dict[str, Tensor] | None = None
         self.counter = 0
 
-    def step(self, metrics: dict[str, float], model: torch.nn.Module) -> bool:
+    def step(
+        self, metrics: dict[str, float], model: torch.nn.Module
+    ) -> tuple[bool, bool]:
+        """
+        return improved, should_stop
+        improved: melhorou nesta época?
+        should_stop: paciência esgotada.
+        """
         if self.metric_key not in metrics:
             raise KeyError(
                 f"patience_metric='{self.metric_key}' ausente em {list(metrics)}"
@@ -69,10 +101,10 @@ class EarlyStopping:
                 for name, tensor in model.state_dict().items()
             }
             self.counter = 0
-            return False
+            return True, False
 
         self.counter += 1
-        return self.counter >= self.cfg.patience
+        return improved, self.counter >= self.cfg.patience
 
     def restore(self, model: torch.nn.Module) -> None:
         if self.best_state is not None:
@@ -196,11 +228,29 @@ def train(
     runtime: Runtime,
     full_data: HeteroData | None = None,
     eval_edge_index: Tensor | None = None,
+    resume_ckpt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     model = model.to(runtime.device)
 
     early_stopper = EarlyStopping(cfg.early_stop, k=cfg.eval.patience_k)
     history: list[dict[str, Any]] = []
+    if resume_ckpt is not None:
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        opt.load_state_dict(resume_ckpt["optimizer_state_dict"])
+        early_stopper.best_metric = resume_ckpt["best_metric"]
+        early_stopper.counter = resume_ckpt.get("early_stop_counter", 0)
+        start_epoch = resume_ckpt["epoch"] + 1
+        logger.info(
+            "Retomando treino da época %d (best %s=%.4f, patience=%d/%d)",
+            start_epoch,
+            early_stopper.metric_key,
+            early_stopper.best_metric,
+            early_stopper.counter,
+            cfg.early_stop.patience,
+        )
+    best_ckpt_path = runtime.run_dir / "best.pt"
+    last_ckpt_path = runtime.run_dir / "last.pt"
+    wandb_run_id = runtime.wandb_run.id if runtime.wandb_run is not None else None
 
     epoch_pbar = tqdm(
         range(1, cfg.train.num_epochs + 1),
@@ -276,7 +326,27 @@ def train(
                 )
             epoch_pbar.set_postfix(ep_postfix)
 
-            should_stop = early_stopper.step(val_metrics, model)
+            improved, should_stop = early_stopper.step(val_metrics, model)
+            if improved:
+                _save_checkpoint(
+                    best_ckpt_path,
+                    model=model,
+                    opt=opt,
+                    epoch=epoch,
+                    best_metric=early_stopper.best_metric,
+                    metrics=log_dict,
+                )
+            # Salvemento dos pesos mais recentes.
+            _save_checkpoint(
+                last_ckpt_path,
+                model=model,
+                opt=opt,
+                epoch=epoch,
+                best_metric=early_stopper.best_metric,
+                metrics=log_dict,
+                early_stop_counter=early_stopper.counter,
+                wandb_run_id=wandb_run_id,
+            )
 
         if runtime.wandb_run is not None and (
             epoch % cfg.log_every == 0 or should_eval or should_stop
@@ -295,7 +365,14 @@ def train(
             break
 
     epoch_pbar.close()
-    early_stopper.restore(model)
+
+    if early_stopper.best_state is not None:
+        early_stopper.restore(model)
+    elif best_ckpt_path.exists():
+        best_ckpt = torch.load(
+            best_ckpt_path, map_location=runtime.device, weights_only=False
+        )
+        model.load_state_dict(best_ckpt["model_state_dict"])
 
     return {
         f"best_{early_stopper.metric_key}": early_stopper.best_metric,

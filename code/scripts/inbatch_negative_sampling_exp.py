@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
         help="Caminho para o arquivo JSON de configuração.",
     )
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("runs"),
+        help="Diretório base onde a pasta da execução será criada.",
+    )
+    parser.add_argument(
         "--wandb-mode",
         type=str,
         default="disabled",
@@ -43,8 +49,28 @@ def main() -> None:
 
     args = parse_args()
     cfg = load_config(args.config)
-    runtime = build_runtime(cfg, wandb_mode=args.wandb_mode)
 
+    resume_ckpt = None
+    resume_run_dir = None
+    resume_wandb_id = None
+
+    if args.resume is not None:
+        ckpt_path = args.resume / "last.pt" if args.resume.is_dir() else args.resume
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Checkpoint não encontrado: {ckpt_path}")
+        resume_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        resume_run_dir = ckpt_path.parent
+        resume_wandb_id = resume_ckpt.get("wandb_run_id")
+
+    runtime = build_runtime(
+        cfg,
+        args.output_dir,
+        wandb_mode=args.wandb_mode,
+        run_dir=resume_run_dir,
+        wandb_run_id=resume_wandb_id,
+    )
+
+    logger.info("Artefatos de execução serão salvos em: %s", args.output_dir)
     try:
         dataset = get_dataset(
             cfg.data.dataset,
@@ -108,6 +134,7 @@ def main() -> None:
             runtime=runtime,
             full_data=final_data,
             eval_edge_index=dataset.eval_test_edge_index,
+            resume_ckpt=resume_ckpt,
         )
 
     finally:
