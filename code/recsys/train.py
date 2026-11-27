@@ -335,6 +335,8 @@ def train(
                     epoch=epoch,
                     best_metric=early_stopper.best_metric,
                     metrics=log_dict,
+                    early_stop_counter=early_stopper.counter,
+                    wandb_run_id=wandb_run_id,
                 )
             # Salvemento dos pesos mais recentes.
             _save_checkpoint(
